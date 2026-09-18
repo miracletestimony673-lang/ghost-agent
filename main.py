@@ -1,7 +1,5 @@
 """
-Ghost Agent backend.
-
-Frozen contract, Phase 4 (extended).
+Ghost Agent backend with Postgres persistence.
 
 Endpoints:
     GET  /health
@@ -13,18 +11,18 @@ Endpoints:
     GET  /capabilities
     GET  /models
 
-Storage: in-memory dict. Development only.
+Storage: Postgres. Accounts and sessions persist across redeploys.
 
-Provider: Groq. The Groq API key is read from GROQ_API_KEY and is never
-returned in any response.
+Provider: Groq. The Groq API key is read from GROQ_API_KEY.
 """
 
 import os
 import time
 import uuid
 import json
-from typing import Any
+from typing import Any, Optional
 
+import asyncpg
 import bcrypt
 import httpx
 import jwt
@@ -39,22 +37,15 @@ from pydantic import BaseModel, EmailStr, Field
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
-GROQ_AUDIO_TRANSCRIPTION_URL = f"{GROQ_BASE}/audio/transcriptions"
-GROQ_AUDIO_SPEECH_URL = f"{GROQ_BASE}/audio/speech"
 
 BCRYPT_ROUNDS = 12
 
-# Model mapping. Server-side only. The app sends `task`, the backend picks
-# the model. This lets us swap Groq models without an app update.
-#
-# Groq's catalogue changes often. If a model returns "does not exist or you
-# do not have access", it has either been retired or gated to a paid tier.
-# Replace the id here and redeploy.
 MODEL_BY_TASK = {
     "text":           "openai/gpt-oss-120b",
     "text-fast":      "openai/gpt-oss-20b",
@@ -69,21 +60,69 @@ MODEL_BY_TASK = {
     "stt-fast":       "whisper-large-v3-turbo",
 }
 
-# Phase 4 app surface is text only. These tasks are accepted by the backend
-# but the app will not send them until later phases. We do NOT return 501
-# for them anymore because the models exist.
-TTS_STT_ENABLED = False  # flip to True when the app has UI for them
+TTS_STT_ENABLED = False
 
 
-app = FastAPI(title="Ghost Agent Backend", version="phase4")
+app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
 
 
 # ----------------------------------------------------------------------------
-# In-memory stores (development only)
+# Database
 # ----------------------------------------------------------------------------
 
-accounts_by_email: dict[str, dict[str, Any]] = {}
-sessions: dict[str, dict[str, Any]] = {}
+_db_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    if _db_pool is None:
+        raise HTTPException(status_code=500, detail="database not initialized")
+    return _db_pool
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id   TEXT PRIMARY KEY,
+    email        TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at   BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token       TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+    expires_at  BIGINT NOT NULL,
+    created_at  BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_account_id ON sessions(account_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+"""
+
+
+@app.on_event("startup")
+async def on_startup():
+    global _db_pool
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Configure it in Render's environment variables."
+        )
+    _db_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
+    )
+    async with _db_pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global _db_pool
+    if _db_pool is not None:
+        await _db_pool.close()
+        _db_pool = None
 
 
 # ----------------------------------------------------------------------------
@@ -116,6 +155,10 @@ class ChatRequest(BaseModel):
 # Helpers
 # ----------------------------------------------------------------------------
 
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def make_account_id() -> str:
     return f"acc_{uuid.uuid4().hex[:16]}"
 
@@ -134,16 +177,15 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def issue_token(account_id: str) -> tuple[str, int]:
-    now_ms = int(time.time() * 1000)
-    expires_ms = now_ms + TOKEN_EXPIRE_DAYS * 24 * 60 * 60 * 1000
+def make_token(account_id: str) -> tuple[str, int]:
+    now = now_ms()
+    expires_ms = now + TOKEN_EXPIRE_DAYS * 24 * 60 * 60 * 1000
     payload = {
         "sub": account_id,
-        "iat": now_ms // 1000,
+        "iat": now // 1000,
         "exp": expires_ms // 1000,
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    sessions[token] = {"accountId": account_id, "expiresAt": expires_ms}
     return token, expires_ms
 
 
@@ -156,20 +198,28 @@ def decode_token(token: str) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="invalid session")
 
 
-def get_current_account(authorization: str | None = Header(default=None)) -> str:
+async def get_current_account(
+    authorization: str | None = Header(default=None),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing or malformed authorization header")
     token = authorization.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="missing session token")
-    if token not in sessions:
+
+    row = await pool.fetchrow(
+        "SELECT account_id, expires_at FROM sessions WHERE token = $1",
+        token,
+    )
+    if row is None:
         raise HTTPException(status_code=401, detail="invalid session")
-    info = sessions[token]
-    if info["expiresAt"] < int(time.time() * 1000):
-        sessions.pop(token, None)
+    if row["expires_at"] < now_ms():
+        await pool.execute("DELETE FROM sessions WHERE token = $1", token)
         raise HTTPException(status_code=401, detail="session expired")
+
     decode_token(token)
-    return info["accountId"]
+    return row["account_id"]
 
 
 # ----------------------------------------------------------------------------
@@ -186,19 +236,28 @@ async def health() -> dict[str, bool]:
 # ----------------------------------------------------------------------------
 
 @app.post("/auth/register", status_code=201)
-async def register(req: RegisterRequest) -> dict[str, Any]:
+async def register(
+    req: RegisterRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict[str, Any]:
     email = req.email.lower()
-    if email in accounts_by_email:
+    existing = await pool.fetchrow("SELECT account_id FROM accounts WHERE email = $1", email)
+    if existing is not None:
         raise HTTPException(status_code=409, detail="email already registered")
 
     account_id = make_account_id()
     display_name = req.displayName or email.split("@")[0]
-    accounts_by_email[email] = {
-        "accountId": account_id,
-        "email": email,
-        "displayName": display_name,
-        "passwordHash": hash_password(req.password),
-    }
+    await pool.execute(
+        """
+        INSERT INTO accounts (account_id, email, display_name, password_hash, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        account_id,
+        email,
+        display_name,
+        hash_password(req.password),
+        now_ms(),
+    )
     return {
         "accountId": account_id,
         "email": email,
@@ -207,44 +266,67 @@ async def register(req: RegisterRequest) -> dict[str, Any]:
 
 
 @app.post("/auth/login")
-async def login(req: LoginRequest) -> dict[str, Any]:
+async def login(
+    req: LoginRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict[str, Any]:
     email = req.email.lower()
-    account = accounts_by_email.get(email)
-    if not account:
+    row = await pool.fetchrow(
+        "SELECT account_id, display_name, password_hash FROM accounts WHERE email = $1",
+        email,
+    )
+    if row is None:
         raise HTTPException(status_code=401, detail="invalid email or password")
-    if not verify_password(req.password, account["passwordHash"]):
+    if not verify_password(req.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid email or password")
 
-    token, expires_ms = issue_token(account["accountId"])
+    token, expires_ms = make_token(row["account_id"])
+    await pool.execute(
+        """
+        INSERT INTO sessions (token, account_id, expires_at, created_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        token,
+        row["account_id"],
+        expires_ms,
+        now_ms(),
+    )
     return {
         "session": token,
         "expiresAt": expires_ms,
-        "accountId": account["accountId"],
-        "displayName": account["displayName"],
+        "accountId": row["account_id"],
+        "displayName": row["display_name"],
     }
 
 
 @app.post("/auth/logout")
-async def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
+async def logout(
+    authorization: str | None = Header(default=None),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict[str, bool]:
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
-        sessions.pop(token, None)
+        await pool.execute("DELETE FROM sessions WHERE token = $1", token)
     return {"ok": True}
 
 
 @app.get("/auth/session")
-async def session_check(account_id: str = Depends(get_current_account)) -> dict[str, Any]:
-    expires_at = None
-    for info in sessions.values():
-        if info["accountId"] == account_id:
-            expires_at = info["expiresAt"]
-            break
-    if expires_at is None:
+async def session_check(
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    row = await pool.fetchrow(
+        "SELECT expires_at FROM sessions WHERE token = $1",
+        token,
+    )
+    if row is None:
         raise HTTPException(status_code=401, detail="session not found")
     return {
         "valid": True,
         "accountId": account_id,
-        "expiresAt": expires_at,
+        "expiresAt": row["expires_at"],
     }
 
 
@@ -264,13 +346,11 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 
 
 # ----------------------------------------------------------------------------
-# Routes — models (informational, no auth, safe to expose)
+# Routes — models
 # ----------------------------------------------------------------------------
 
 @app.get("/models")
 async def models() -> dict[str, str]:
-    # Return the current server-side model mapping. Useful for debugging and
-    # for a future in-app model picker. Contains no secrets.
     return dict(MODEL_BY_TASK)
 
 
@@ -280,7 +360,6 @@ async def models() -> dict[str, str]:
 
 @app.post("/chat")
 async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)) -> dict[str, Any]:
-    # TTS / STT are gated. When the app has UI for them, flip TTS_STT_ENABLED.
     if req.task in ("tts", "tts-arabic", "stt", "stt-fast"):
         if not TTS_STT_ENABLED:
             raise HTTPException(
@@ -288,7 +367,6 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
                 detail=f"task '{req.task}' is not enabled yet",
             )
 
-    # Vision guardrail: reject if no image is present.
     if req.task == "vision":
         has_image = False
         for m in req.messages:
@@ -308,31 +386,19 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
 
     model = MODEL_BY_TASK.get(req.task)
     if not model:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported task: {req.task}",
-        )
+        raise HTTPException(status_code=400, detail=f"unsupported task: {req.task}")
 
     if not GROQ_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured on the server",
-        )
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server")
 
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
     for m in req.messages:
         if m.role not in ("system", "user", "assistant"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"invalid role: {m.role}",
-            )
+            raise HTTPException(status_code=400, detail=f"invalid role: {m.role}")
         if m.content is None:
-            raise HTTPException(
-                status_code=400,
-                detail="message content must not be null",
-            )
+            raise HTTPException(status_code=400, detail="message content must not be null")
 
     payload = {
         "model": model,
@@ -365,16 +431,10 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
                     retry_after_ms = int(detail["retry_after"]) * 1000
         except Exception:
             pass
-        raise HTTPException(
-            status_code=429,
-            detail={"retryAfterMs": retry_after_ms},
-        )
+        raise HTTPException(status_code=429, detail={"retryAfterMs": retry_after_ms})
 
     if resp.status_code >= 500:
-        raise HTTPException(
-            status_code=500,
-            detail=f"provider error {resp.status_code}",
-        )
+        raise HTTPException(status_code=500, detail=f"provider error {resp.status_code}")
 
     if resp.status_code >= 400:
         try:
@@ -414,7 +474,7 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
 
 
 # ----------------------------------------------------------------------------
-# Error handler — every error body must include a `detail` field as JSON.
+# Error handler
 # ----------------------------------------------------------------------------
 
 @app.exception_handler(HTTPException)
