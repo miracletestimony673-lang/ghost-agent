@@ -1,7 +1,7 @@
 """
 Ghost Agent backend.
 
-Frozen contract, Phase 4.
+Frozen contract, Phase 4 (extended).
 
 Endpoints:
     GET  /health
@@ -11,12 +11,12 @@ Endpoints:
     GET  /auth/session
     POST /chat
     GET  /capabilities
+    GET  /models
 
-Storage: in-memory dict. Development only. Replace with a real database
-before any production use.
+Storage: in-memory dict. Development only.
 
-Provider: Groq. The Groq API key is read from the GROQ_API_KEY environment
-variable and is never returned in any response.
+Provider: Groq. The Groq API key is read from GROQ_API_KEY and is never
+returned in any response.
 """
 
 import os
@@ -42,15 +42,37 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-MODEL_BY_TASK = {
-    "text": "llama-3.3-70b-versatile",
-    "vision": "llama-3.2-90b-vision-preview",
-    "reasoning": "deepseek-r1-distill-llama-70b",
-}
+GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
+GROQ_AUDIO_TRANSCRIPTION_URL = f"{GROQ_BASE}/audio/transcriptions"
+GROQ_AUDIO_SPEECH_URL = f"{GROQ_BASE}/audio/speech"
 
 BCRYPT_ROUNDS = 12
+
+# Model mapping. Server-side only. The app sends `task`, the backend picks
+# the model. This lets us swap Groq models without an app update.
+#
+# Groq's catalogue changes often. If a model returns "does not exist or you
+# do not have access", it has either been retired or gated to a paid tier.
+# Replace the id here and redeploy.
+MODEL_BY_TASK = {
+    "text":           "openai/gpt-oss-120b",
+    "text-fast":      "openai/gpt-oss-20b",
+    "text-tiny":      "llama-3.1-8b-instant",
+    "reasoning":      "openai/gpt-oss-120b",
+    "reasoning-deep": "openai/gpt-oss-120b",
+    "vision":         "qwen/qwen3.8-27b",
+    "moderation":     "openai/gpt-oss-safeguard-20b",
+    "tts":            "canopylabs/orpheus-v1-english",
+    "tts-arabic":     "canopylabs/orpheus-arabic-saudi",
+    "stt":            "whisper-large-v3",
+    "stt-fast":       "whisper-large-v3-turbo",
+}
+
+# Phase 4 app surface is text only. These tasks are accepted by the backend
+# but the app will not send them until later phases. We do NOT return 501
+# for them anymore because the models exist.
+TTS_STT_ENABLED = False  # flip to True when the app has UI for them
 
 
 app = FastAPI(title="Ghost Agent Backend", version="phase4")
@@ -234,11 +256,22 @@ async def session_check(account_id: str = Depends(get_current_account)) -> dict[
 async def capabilities(account_id: str = Depends(get_current_account)) -> dict[str, bool]:
     return {
         "text": True,
-        "vision": False,
+        "vision": True,
         "reasoning": True,
-        "tts": False,
-        "stt": False,
+        "tts": TTS_STT_ENABLED,
+        "stt": TTS_STT_ENABLED,
     }
+
+
+# ----------------------------------------------------------------------------
+# Routes — models (informational, no auth, safe to expose)
+# ----------------------------------------------------------------------------
+
+@app.get("/models")
+async def models() -> dict[str, str]:
+    # Return the current server-side model mapping. Useful for debugging and
+    # for a future in-app model picker. Contains no secrets.
+    return dict(MODEL_BY_TASK)
 
 
 # ----------------------------------------------------------------------------
@@ -247,12 +280,15 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 
 @app.post("/chat")
 async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)) -> dict[str, Any]:
-    if req.task in ("tts", "stt"):
-        raise HTTPException(
-            status_code=501,
-            detail=f"task '{req.task}' is not implemented in Phase 4",
-        )
+    # TTS / STT are gated. When the app has UI for them, flip TTS_STT_ENABLED.
+    if req.task in ("tts", "tts-arabic", "stt", "stt-fast"):
+        if not TTS_STT_ENABLED:
+            raise HTTPException(
+                status_code=501,
+                detail=f"task '{req.task}' is not enabled yet",
+            )
 
+    # Vision guardrail: reject if no image is present.
     if req.task == "vision":
         has_image = False
         for m in req.messages:
@@ -343,7 +379,13 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
     if resp.status_code >= 400:
         try:
             body = resp.json()
-            message = body.get("error", {}).get("message") if isinstance(body, dict) else None
+            message = None
+            if isinstance(body, dict):
+                err = body.get("error")
+                if isinstance(err, dict):
+                    message = err.get("message")
+                elif isinstance(err, str):
+                    message = err
         except Exception:
             message = None
         raise HTTPException(
