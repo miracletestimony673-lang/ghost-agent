@@ -13,12 +13,37 @@ server-side. The app never sees the key.
 - `POST /chat` — proxy to Groq
 - `GET  /capabilities` — which task types are available
 
-## Setup
+## Environment variables
 
-1. Set environment variables:
-   - `GROQ_API_KEY` (required)
-   - `JWT_SECRET` (recommended; defaults to a dev value)
+- `GROQ_API_KEY` — required for `/chat` to work. Get one from https://console.groq.com
+- `JWT_SECRET` — any random string. Change in production.
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
+## Deploy to Render (free tier)
+
+1. Push `main.py` and `requirements.txt` to a GitHub repo.
+2. Go to https://render.com and sign in with GitHub.
+3. Click **New** → **Web Service**.
+4. Select your repo.
+5. Render detects Python. Set:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+6. Under **Environment**, add:
+   - `GROQ_API_KEY` = your key
+   - `JWT_SECRET` = any long random string
+7. Click **Create Web Service**.
+8. Wait for the deploy to finish. You get a URL like `https://ghost-agent-backend.onrender.com`.
+
+## Test
+
+From any terminal with internet access:
+
+    curl https://your-render-url.onrender.com/health
+
+Expected:
+
+    {"ok":true}
+
+## Notes
+
+- Storage is in-memory. Restarting the server loses all accounts. Fine for Phase 4. Replace with a real database before production.
+- Free tier on Render spins down after 15 minutes of inactivity. First request after idle takes ~30 seconds.
