@@ -25,12 +25,12 @@ import uuid
 import json
 from typing import Any
 
+import bcrypt
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
-from passlib.context import CryptContext
 
 
 # ----------------------------------------------------------------------------
@@ -44,17 +44,14 @@ TOKEN_EXPIRE_DAYS = 7
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Model mapping. Server-side only. The app never sees these ids except in the
-# `model` field of a successful response, which is informational only.
 MODEL_BY_TASK = {
     "text": "llama-3.3-70b-versatile",
     "vision": "llama-3.2-90b-vision-preview",
     "reasoning": "deepseek-r1-distill-llama-70b",
-    # tts and stt return 501 in Phase 4
 }
 
+BCRYPT_ROUNDS = 12
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI(title="Ghost Agent Backend", version="phase4")
 
@@ -63,10 +60,7 @@ app = FastAPI(title="Ghost Agent Backend", version="phase4")
 # In-memory stores (development only)
 # ----------------------------------------------------------------------------
 
-# accounts: email -> {accountId, email, displayName, passwordHash}
 accounts_by_email: dict[str, dict[str, Any]] = {}
-
-# tokens: session_token -> {accountId, expiresAt}
 sessions: dict[str, dict[str, Any]] = {}
 
 
@@ -105,12 +99,15 @@ def make_account_id() -> str:
 
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(
+        plain.encode("utf-8"),
+        bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
+    ).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     try:
-        return pwd_context.verify(plain, hashed)
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
 
@@ -124,7 +121,6 @@ def issue_token(account_id: str) -> tuple[str, int]:
         "exp": expires_ms // 1000,
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    # Track the token so we can invalidate on logout.
     sessions[token] = {"accountId": account_id, "expiresAt": expires_ms}
     return token, expires_ms
 
@@ -145,13 +141,11 @@ def get_current_account(authorization: str | None = Header(default=None)) -> str
     if not token:
         raise HTTPException(status_code=401, detail="missing session token")
     if token not in sessions:
-        # Token was never issued by this process, or was logged out.
         raise HTTPException(status_code=401, detail="invalid session")
     info = sessions[token]
     if info["expiresAt"] < int(time.time() * 1000):
         sessions.pop(token, None)
         raise HTTPException(status_code=401, detail="session expired")
-    # Also verify the JWT signature, so tampering is caught.
     decode_token(token)
     return info["accountId"]
 
@@ -210,7 +204,6 @@ async def login(req: LoginRequest) -> dict[str, Any]:
 
 @app.post("/auth/logout")
 async def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
-    # Idempotent. Even with an invalid or missing token, return 200.
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
         sessions.pop(token, None)
@@ -219,7 +212,6 @@ async def logout(authorization: str | None = Header(default=None)) -> dict[str, 
 
 @app.get("/auth/session")
 async def session_check(account_id: str = Depends(get_current_account)) -> dict[str, Any]:
-    # Find the expiry for this account's current session.
     expires_at = None
     for info in sessions.values():
         if info["accountId"] == account_id:
@@ -240,7 +232,6 @@ async def session_check(account_id: str = Depends(get_current_account)) -> dict[
 
 @app.get("/capabilities")
 async def capabilities(account_id: str = Depends(get_current_account)) -> dict[str, bool]:
-    # Phase 4: text and reasoning are on; vision, tts, stt are off.
     return {
         "text": True,
         "vision": False,
@@ -256,14 +247,12 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 
 @app.post("/chat")
 async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)) -> dict[str, Any]:
-    # Phase 4 guardrail: tts / stt return 501 with an exact detail string.
     if req.task in ("tts", "stt"):
         raise HTTPException(
             status_code=501,
             detail=f"task '{req.task}' is not implemented in Phase 4",
         )
 
-    # Vision guardrail: reject if no image is present.
     if req.task == "vision":
         has_image = False
         for m in req.messages:
@@ -281,7 +270,6 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
                 detail="task 'vision' requires an image",
             )
 
-    # Only text and reasoning reach Groq in Phase 4.
     model = MODEL_BY_TASK.get(req.task)
     if not model:
         raise HTTPException(
@@ -298,7 +286,6 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
-    # Validate message roles.
     for m in req.messages:
         if m.role not in ("system", "user", "assistant"):
             raise HTTPException(
@@ -354,7 +341,6 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
         )
 
     if resp.status_code >= 400:
-        # Surface the provider's own message so the app can show it.
         try:
             body = resp.json()
             message = body.get("error", {}).get("message") if isinstance(body, dict) else None
