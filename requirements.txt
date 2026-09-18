@@ -5,3 +5,4 @@ bcrypt==4.2.1
 pyjwt
 email-validator
 pydantic[email]
+asyncpg==0.30.0
