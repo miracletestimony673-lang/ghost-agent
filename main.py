@@ -5,7 +5,6 @@ Endpoints:
     GET  /health
     POST /auth/register
     POST /auth/login
-    POST /auth/google
     POST /auth/logout
     GET  /auth/session
     POST /chat
@@ -30,7 +29,7 @@ import bcrypt
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 
 # Google Auth imports
@@ -55,10 +54,10 @@ GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 BCRYPT_ROUNDS = 12
 
 MODEL_BY_TASK = {
-    "text":           "openai/gpt-oss-120b",
+    "text":           "qwen/qwen3.8-27b",
     "text-fast":      "openai/gpt-oss-20b",
     "text-tiny":      "llama-3.1-8b-instant",
-    "reasoning":      "openai/gpt-oss-120b",
+    "reasoning":      "qwen/qwen3.8-27b",
     "reasoning-deep": "openai/gpt-oss-120b",
     "vision":         "qwen/qwen3.8-27b",
     "moderation":     "openai/gpt-oss-safeguard-20b",
@@ -149,9 +148,6 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
-class GoogleAuthRequest(BaseModel):
-    idToken: str
-
 class ChatMessage(BaseModel):
     role: str
     content: Any = None
@@ -212,30 +208,6 @@ def decode_token(token: str) -> dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=401, detail="invalid session")
 
-def verify_google_id_token(token: str) -> dict[str, Any]:
-    if not GOOGLE_CLIENT_ID:
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_CLIENT_ID is not configured",
-        )
-    try:
-        info = google_id_token.verify_oauth2_token(
-            token,
-            google_requests.Request(),
-            GOOGLE_CLIENT_ID,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"invalid google token: {e}",
-        )
-    if not info.get("email_verified"):
-        raise HTTPException(
-            status_code=401,
-            detail="google email is not verified",
-        )
-    return info
-
 async def get_current_account(
     authorization: str | None = Header(default=None),
     pool: asyncpg.Pool = Depends(get_pool),
@@ -270,6 +242,105 @@ async def health() -> dict[str, bool]:
 # ----------------------------------------------------------------------------
 # Routes — auth
 # ----------------------------------------------------------------------------
+
+# Google Sign-In helper
+def verify_google_id_token(token: str) -> dict[str, Any]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_CLIENT_ID is not configured",
+        )
+    try:
+        info = google_id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"invalid google token: {e}",
+        )
+    if not info.get("email_verified"):
+        raise HTTPException(
+            status_code=401,
+            detail="google email is not verified",
+        )
+    return info
+
+class GoogleAuthRequest(BaseModel):
+    idToken: str
+
+@app.post("/auth/google")
+async def auth_google(
+    req: GoogleAuthRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict[str, Any]:
+    if not req.idToken:
+        raise HTTPException(status_code=400, detail="missing idToken")
+
+    # Verify Google token
+    google_info = verify_google_id_token(req.idToken)
+    email = google_info.get("email")
+    display_name = google_info.get("name") or email.split("@")[0]
+
+    if not email:
+        raise HTTPException(status_code=401, detail="google token missing email")
+
+    email = email.lower()
+
+    # Check existing account
+    row = await pool.fetchrow(
+        "SELECT account_id, auth_provider FROM accounts WHERE email = $1",
+        email,
+    )
+
+    if row is not None:
+        # Account exists - check auth provider
+        if row["auth_provider"] == "password":
+            raise HTTPException(
+                status_code=409,
+                detail="this email is registered with a password, sign in with your password",
+            )
+        # Google account exists - use it
+        account_id = row["account_id"]
+    else:
+        # Create new Google account
+        account_id = make_account_id()
+        await pool.execute(
+            """
+            INSERT INTO accounts (account_id, email, display_name, password_hash, auth_provider, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            account_id,
+            email,
+            display_name,
+            None,  # password_hash is NULL for Google accounts
+            "google",
+            now_ms(),
+        )
+
+    # Issue Ghost JWT
+    token, expires_ms = make_token(account_id)
+
+    # Store session
+    await pool.execute(
+        """
+        INSERT INTO sessions (token, account_id, expires_at, created_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        token,
+        account_id,
+        expires_ms,
+        now_ms(),
+    )
+
+    return {
+        "session": token,
+        "expiresAt": expires_ms,
+        "accountId": account_id,
+        "displayName": display_name,
+    }
 
 @app.post("/auth/register", status_code=201)
 async def register(
@@ -331,70 +402,6 @@ async def login(
         "expiresAt": expires_ms,
         "accountId": row["account_id"],
         "displayName": row["display_name"],
-    }
-
-@app.post("/auth/google")
-async def auth_google(
-    req: GoogleAuthRequest,
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> dict[str, Any]:
-    if not req.idToken:
-        raise HTTPException(status_code=400, detail="missing idToken")
-
-    google_info = verify_google_id_token(req.idToken)
-    email = google_info.get("email")
-    display_name = google_info.get("name") or email.split("@")[0]
-
-    if not email:
-        raise HTTPException(status_code=401, detail="google token missing email")
-
-    email = email.lower()
-
-    row = await pool.fetchrow(
-        "SELECT account_id, auth_provider FROM accounts WHERE email = $1",
-        email,
-    )
-
-    if row is not None:
-        if row["auth_provider"] == "password":
-            raise HTTPException(
-                status_code=409,
-                detail="this email is registered with a password, sign in with your password",
-            )
-        account_id = row["account_id"]
-    else:
-        account_id = make_account_id()
-        await pool.execute(
-            """
-            INSERT INTO accounts (account_id, email, display_name, password_hash, auth_provider, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            """,
-            account_id,
-            email,
-            display_name,
-            None,
-            "google",
-            now_ms(),
-        )
-
-    token, expires_ms = make_token(account_id)
-
-    await pool.execute(
-        """
-        INSERT INTO sessions (token, account_id, expires_at, created_at)
-        VALUES ($1, $2, $3, $4)
-        """,
-        token,
-        account_id,
-        expires_ms,
-        now_ms(),
-    )
-
-    return {
-        "session": token,
-        "expiresAt": expires_ms,
-        "accountId": account_id,
-        "displayName": display_name,
     }
 
 @app.post("/auth/logout")
@@ -552,8 +559,51 @@ async def web_fetch(
 # Routes — chat
 # ----------------------------------------------------------------------------
 
+async def stream_groq(groq_messages, model, tools):
+    payload = {
+        "model": model,
+        "messages": groq_messages,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                GROQ_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    error_msg = body[:200].decode("utf-8", "ignore") if body else "Unknown error"
+                    yield f"data: {{\"error\":\"provider error {response.status_code}: {error_msg}\"}}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        yield f"{line}\n\n"
+    except httpx.TimeoutException:
+        yield 'data: {"error":"upstream timeout"}\n\n'
+        yield "data: [DONE]\n\n"
+    except httpx.HTTPError as e:
+        yield f'data: {{\"error\":\"upstream error: {type(e).__name__}\"}}\n\n'
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        error_msg = str(e)[:200]
+        yield f'data: {{\"error\":\"stream error: {error_msg}\"}}\n\n'
+        yield "data: [DONE]\n\n"
+
 @app.post("/chat")
-async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)) -> dict[str, Any]:
+async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)):
     if req.task in ("tts", "tts-arabic", "stt", "stt-fast"):
         if not TTS_STT_ENABLED:
             raise HTTPException(
@@ -605,6 +655,16 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
         if m.tool_call_id is not None:
             msg["tool_call_id"] = m.tool_call_id
         groq_messages.append(msg)
+
+    if req.stream:
+        return StreamingResponse(
+            stream_groq(groq_messages, model, req.tools),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     payload = {
         "model": model,
