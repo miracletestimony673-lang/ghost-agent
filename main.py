@@ -5,6 +5,7 @@ Endpoints:
     GET  /health
     POST /auth/register
     POST /auth/login
+    POST /auth/google
     POST /auth/logout
     GET  /auth/session
     POST /chat
@@ -30,6 +31,9 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
+# Google Auth imports
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -38,6 +42,7 @@ from pydantic import BaseModel, EmailStr, Field
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
@@ -62,9 +67,7 @@ MODEL_BY_TASK = {
 
 TTS_STT_ENABLED = False
 
-
 app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
-
 
 # ----------------------------------------------------------------------------
 # Database
@@ -72,19 +75,18 @@ app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
 
 _db_pool: Optional[asyncpg.Pool] = None
 
-
 async def get_pool() -> asyncpg.Pool:
     if _db_pool is None:
         raise HTTPException(status_code=500, detail="database not initialized")
     return _db_pool
-
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS accounts (
     account_id   TEXT PRIMARY KEY,
     email        TEXT UNIQUE NOT NULL,
     display_name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
+    password_hash TEXT NULL,
+    auth_provider TEXT NOT NULL DEFAULT 'password',
     created_at   BIGINT NOT NULL
 );
 
@@ -99,6 +101,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_account_id ON sessions(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 """
 
+MIGRATION_SQL = """
+ALTER TABLE accounts ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'password';
+"""
 
 @app.on_event("startup")
 async def on_startup():
@@ -115,7 +121,10 @@ async def on_startup():
     )
     async with _db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
-
+        try:
+            await conn.execute(MIGRATION_SQL)
+        except Exception:
+            pass
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -123,7 +132,6 @@ async def on_shutdown():
     if _db_pool is not None:
         await _db_pool.close()
         _db_pool = None
-
 
 # ----------------------------------------------------------------------------
 # DTOs
@@ -134,22 +142,21 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     displayName: str | None = None
 
-
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class GoogleAuthRequest(BaseModel):
+    idToken: str
 
 class ChatMessage(BaseModel):
     role: str
     content: Any
 
-
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     task: str = "text"
     stream: bool = False
-
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -158,10 +165,8 @@ class ChatRequest(BaseModel):
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-
 def make_account_id() -> str:
     return f"acc_{uuid.uuid4().hex[:16]}"
-
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(
@@ -169,13 +174,11 @@ def hash_password(plain: str) -> str:
         bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
     ).decode("utf-8")
 
-
 def verify_password(plain: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
-
 
 def make_token(account_id: str) -> tuple[str, int]:
     now = now_ms()
@@ -188,7 +191,6 @@ def make_token(account_id: str) -> tuple[str, int]:
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return token, expires_ms
 
-
 def decode_token(token: str) -> dict[str, Any]:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -197,6 +199,29 @@ def decode_token(token: str) -> dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=401, detail="invalid session")
 
+def verify_google_id_token(token: str) -> dict[str, Any]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_CLIENT_ID is not configured",
+        )
+    try:
+        info = google_id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"invalid google token: {e}",
+        )
+    if not info.get("email_verified"):
+        raise HTTPException(
+            status_code=401,
+            detail="google email is not verified",
+        )
+    return info
 
 async def get_current_account(
     authorization: str | None = Header(default=None),
@@ -221,7 +246,6 @@ async def get_current_account(
     decode_token(token)
     return row["account_id"]
 
-
 # ----------------------------------------------------------------------------
 # Routes — health
 # ----------------------------------------------------------------------------
@@ -229,7 +253,6 @@ async def get_current_account(
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
-
 
 # ----------------------------------------------------------------------------
 # Routes — auth
@@ -264,7 +287,6 @@ async def register(
         "displayName": display_name,
     }
 
-
 @app.post("/auth/login")
 async def login(
     req: LoginRequest,
@@ -298,6 +320,69 @@ async def login(
         "displayName": row["display_name"],
     }
 
+@app.post("/auth/google")
+async def auth_google(
+    req: GoogleAuthRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict[str, Any]:
+    if not req.idToken:
+        raise HTTPException(status_code=400, detail="missing idToken")
+
+    google_info = verify_google_id_token(req.idToken)
+    email = google_info.get("email")
+    display_name = google_info.get("name") or email.split("@")[0]
+
+    if not email:
+        raise HTTPException(status_code=401, detail="google token missing email")
+
+    email = email.lower()
+
+    row = await pool.fetchrow(
+        "SELECT account_id, auth_provider FROM accounts WHERE email = $1",
+        email,
+    )
+
+    if row is not None:
+        if row["auth_provider"] == "password":
+            raise HTTPException(
+                status_code=409,
+                detail="this email is registered with a password, sign in with your password",
+            )
+        account_id = row["account_id"]
+    else:
+        account_id = make_account_id()
+        await pool.execute(
+            """
+            INSERT INTO accounts (account_id, email, display_name, password_hash, auth_provider, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            account_id,
+            email,
+            display_name,
+            None,
+            "google",
+            now_ms(),
+        )
+
+    token, expires_ms = make_token(account_id)
+
+    await pool.execute(
+        """
+        INSERT INTO sessions (token, account_id, expires_at, created_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        token,
+        account_id,
+        expires_ms,
+        now_ms(),
+    )
+
+    return {
+        "session": token,
+        "expiresAt": expires_ms,
+        "accountId": account_id,
+        "displayName": display_name,
+    }
 
 @app.post("/auth/logout")
 async def logout(
@@ -308,7 +393,6 @@ async def logout(
         token = authorization.removeprefix("Bearer ").strip()
         await pool.execute("DELETE FROM sessions WHERE token = $1", token)
     return {"ok": True}
-
 
 @app.get("/auth/session")
 async def session_check(
@@ -329,7 +413,6 @@ async def session_check(
         "expiresAt": row["expires_at"],
     }
 
-
 # ----------------------------------------------------------------------------
 # Routes — capabilities
 # ----------------------------------------------------------------------------
@@ -344,7 +427,6 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
         "stt": TTS_STT_ENABLED,
     }
 
-
 # ----------------------------------------------------------------------------
 # Routes — models
 # ----------------------------------------------------------------------------
@@ -352,7 +434,6 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 @app.get("/models")
 async def models() -> dict[str, str]:
     return dict(MODEL_BY_TASK)
-
 
 # ----------------------------------------------------------------------------
 # Routes — chat
@@ -471,7 +552,6 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
             "completionTokens": int(usage.get("completion_tokens", 0)),
         },
     }
-
 
 # ----------------------------------------------------------------------------
 # Error handler
