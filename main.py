@@ -52,11 +52,11 @@ GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 BCRYPT_ROUNDS = 12
 
 MODEL_BY_TASK = {
-    "text":           "openai/gpt-oss-120b",
+    "text":           "qwen/qwen3.8-27b",
     "text-fast":      "openai/gpt-oss-20b",
     "text-tiny":      "llama-3.1-8b-instant",
     "reasoning":      "openai/gpt-oss-120b",
-    "reasoning-deep": "openai/gpt-oss-120b",
+    "reasoning-deep": "qwen/qwen3.8-27b",
     "vision":         "qwen/qwen3.8-27b",
     "moderation":     "openai/gpt-oss-safeguard-20b",
     "tts":            "canopylabs/orpheus-v1-english",
