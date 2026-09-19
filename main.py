@@ -151,12 +151,15 @@ class GoogleAuthRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: Any
+    content: Any = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     task: str = "text"
     stream: bool = False
+    tools: list[dict] | None = None
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -476,16 +479,32 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
     for m in req.messages:
-        if m.role not in ("system", "user", "assistant"):
+        if m.role not in ("system", "user", "assistant", "tool"):
             raise HTTPException(status_code=400, detail=f"invalid role: {m.role}")
-        if m.content is None:
+        if m.role not in ("tool",) and m.content is None and m.tool_calls is None:
             raise HTTPException(status_code=400, detail="message content must not be null")
+
+    # Build messages for Groq, preserving all fields
+    groq_messages = []
+    for m in req.messages:
+        msg = {"role": m.role}
+        if m.content is not None:
+            msg["content"] = m.content
+        if m.tool_calls is not None:
+            msg["tool_calls"] = m.tool_calls
+        if m.tool_call_id is not None:
+            msg["tool_call_id"] = m.tool_call_id
+        groq_messages.append(msg)
 
     payload = {
         "model": model,
-        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "messages": groq_messages,
         "stream": False,
     }
+
+    # Forward tools if provided
+    if req.tools:
+        payload["tools"] = req.tools
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -541,11 +560,20 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
 
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    content = message.get("content") or ""
+
+    # Preserve the full message, including tool_calls
+    response_message = {
+        "role": message.get("role", "assistant"),
+        "content": message.get("content"),
+    }
+
+    # Preserve tool_calls if present
+    if message.get("tool_calls"):
+        response_message["tool_calls"] = message["tool_calls"]
 
     usage = data.get("usage") or {}
     return {
-        "message": {"role": "assistant", "content": content},
+        "message": response_message,
         "model": data.get("model", model),
         "usage": {
             "promptTokens": int(usage.get("prompt_tokens", 0)),
