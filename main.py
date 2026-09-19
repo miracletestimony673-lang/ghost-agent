@@ -11,6 +11,8 @@ Endpoints:
     POST /chat
     GET  /capabilities
     GET  /models
+    POST /web/search
+    POST /web/fetch
 
 Storage: Postgres. Accounts and sessions persist across redeploys.
 
@@ -43,6 +45,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
@@ -52,11 +55,11 @@ GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 BCRYPT_ROUNDS = 12
 
 MODEL_BY_TASK = {
-    "text":           "qwen/qwen3.8-27b",
+    "text":           "openai/gpt-oss-120b",
     "text-fast":      "openai/gpt-oss-20b",
     "text-tiny":      "llama-3.1-8b-instant",
     "reasoning":      "openai/gpt-oss-120b",
-    "reasoning-deep": "qwen/qwen3.8-27b",
+    "reasoning-deep": "openai/gpt-oss-120b",
     "vision":         "qwen/qwen3.8-27b",
     "moderation":     "openai/gpt-oss-safeguard-20b",
     "tts":            "canopylabs/orpheus-v1-english",
@@ -160,6 +163,13 @@ class ChatRequest(BaseModel):
     task: str = "text"
     stream: bool = False
     tools: list[dict] | None = None
+
+class WebSearchRequest(BaseModel):
+    query: str
+    maxResults: int = 5
+
+class WebFetchRequest(BaseModel):
+    url: str
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -437,6 +447,106 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 @app.get("/models")
 async def models() -> dict[str, str]:
     return dict(MODEL_BY_TASK)
+
+# ----------------------------------------------------------------------------
+# Routes — web (Tavily proxy)
+# ----------------------------------------------------------------------------
+
+@app.post("/web/search")
+async def web_search(
+    req: WebSearchRequest,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if not TAVILY_API_KEY:
+        raise HTTPException(status_code=500, detail="TAVILY_API_KEY is not configured")
+
+    max_results = max(1, min(req.maxResults, 10))
+
+    payload = {
+        "query": req.query,
+        "max_results": max_results,
+        "search_depth": "basic",
+        "include_answer": False,
+        "include_raw_content": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                headers={
+                    "Authorization": f"Bearer {TAVILY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=500, detail="search provider timeout")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"search provider error: {type(e).__name__}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"search provider rejected request: {resp.status_code}")
+
+    data = resp.json()
+    results = []
+    for r in (data.get("results") or [])[:max_results]:
+        results.append({
+            "title": r.get("title") or "",
+            "url": r.get("url") or "",
+            "content": (r.get("content") or "")[:4000],
+        })
+
+    return {"query": req.query, "results": results}
+
+@app.post("/web/fetch")
+async def web_fetch(
+    req: WebFetchRequest,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    if not req.url.strip():
+        raise HTTPException(status_code=400, detail="url must not be empty")
+    if not TAVILY_API_KEY:
+        raise HTTPException(status_code=500, detail="TAVILY_API_KEY is not configured")
+
+    payload = {"urls": [req.url]}
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.tavily.com/extract",
+                headers={
+                    "Authorization": f"Bearer {TAVILY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=500, detail="fetch provider timeout")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"fetch provider error: {type(e).__name__}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"fetch provider rejected request: {resp.status_code}")
+
+    data = resp.json()
+    results = data.get("results") or []
+    failed = data.get("failed_results") or []
+
+    if not results:
+        reason = "could not extract content"
+        if failed:
+            reason = failed[0].get("error") or reason
+        raise HTTPException(status_code=500, detail=f"fetch failed: {reason}")
+
+    first = results[0]
+    return {
+        "url": first.get("url") or req.url,
+        "title": first.get("title") or "",
+        "content": (first.get("raw_content") or "")[:8000],
+    }
 
 # ----------------------------------------------------------------------------
 # Routes — chat
