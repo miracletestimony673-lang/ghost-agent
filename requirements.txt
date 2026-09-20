@@ -8,3 +8,4 @@ pydantic[email]
 asyncpg==0.30.0
 google-auth
 requests
+redis>=5.0.0
