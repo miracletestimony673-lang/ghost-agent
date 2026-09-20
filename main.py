@@ -8,6 +8,11 @@ Endpoints:
     POST /auth/logout
     GET  /auth/session
     POST /chat
+    GET  /chats
+    POST /chats
+    GET  /chats/{chat_id}
+    PATCH /chats/{chat_id}
+    DELETE /chats/{chat_id}
     GET  /capabilities
     GET  /models
 
@@ -157,11 +162,35 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_account_id ON sessions(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id       TEXT PRIMARY KEY,
+    account_id    TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+    title         TEXT,
+    created_at    BIGINT NOT NULL,
+    updated_at    BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id    TEXT PRIMARY KEY,
+    chat_id       TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    role          TEXT NOT NULL,
+    content       TEXT,
+    tool_calls    JSONB,
+    tool_call_id  TEXT,
+    created_at    BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chats_account_id ON chats(account_id);
+CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
 """
 
 MIGRATION_SQL = """
 ALTER TABLE accounts ALTER COLUMN password_hash DROP NOT NULL;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'password';
+
+-- no migration needed; both tables are new
 """
 
 @app.on_event("startup")
@@ -221,6 +250,7 @@ class ChatRequest(BaseModel):
     task: str = "text"
     stream: bool = False
     tools: list[dict] | None = None
+    chat_id: str | None = None
 
 class WebSearchRequest(BaseModel):
     query: str
@@ -228,6 +258,46 @@ class WebSearchRequest(BaseModel):
 
 class WebFetchRequest(BaseModel):
     url: str
+
+# Chat history DTOs
+class CreateChatResponse(BaseModel):
+    chatId: str
+    title: str | None = None
+    createdAt: int
+    updatedAt: int
+
+class ChatListItem(BaseModel):
+    chatId: str
+    title: str | None = None
+    createdAt: int
+    updatedAt: int
+    messageCount: int
+
+class ChatListResponse(BaseModel):
+    chats: list[ChatListItem]
+
+class ChatMessageResponse(BaseModel):
+    role: str
+    content: str | None = None
+    createdAt: int
+
+class ChatDetailResponse(BaseModel):
+    chatId: str
+    title: str | None = None
+    createdAt: int
+    updatedAt: int
+    messages: list[ChatMessageResponse]
+
+class RenameChatRequest(BaseModel):
+    title: str
+
+class RenameChatResponse(BaseModel):
+    chatId: str
+    title: str
+    updatedAt: int
+
+class DeleteChatResponse(BaseModel):
+    ok: bool = True
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -662,8 +732,269 @@ async def web_fetch(
     }
 
 # ----------------------------------------------------------------------------
+# Routes — chat history
+# ----------------------------------------------------------------------------
+
+@app.post("/chats", status_code=201)
+async def create_chat(
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> CreateChatResponse:
+    chat_id = f"chat_{uuid.uuid4().hex[:16]}"
+    now = now_ms()
+    await pool.execute(
+        """
+        INSERT INTO chats (chat_id, account_id, title, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        chat_id,
+        account_id,
+        None,
+        now,
+        now,
+    )
+    return CreateChatResponse(
+        chatId=chat_id,
+        title=None,
+        createdAt=now,
+        updatedAt=now,
+    )
+
+@app.get("/chats")
+async def list_chats(
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> ChatListResponse:
+    rows = await pool.fetch(
+        """
+        SELECT chat_id, title, created_at, updated_at
+        FROM chats
+        WHERE account_id = $1
+        ORDER BY updated_at DESC
+        LIMIT 100
+        """,
+        account_id,
+    )
+    chats = []
+    for row in rows:
+        message_count = await pool.fetchval(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = $1",
+            row["chat_id"],
+        )
+        chats.append(ChatListItem(
+            chatId=row["chat_id"],
+            title=row["title"],
+            createdAt=row["created_at"],
+            updatedAt=row["updated_at"],
+            messageCount=message_count,
+        ))
+    return ChatListResponse(chats=chats)
+
+@app.get("/chats/{chat_id}")
+async def get_chat(
+    chat_id: str,
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> ChatDetailResponse:
+    row = await pool.fetchrow(
+        "SELECT chat_id, account_id, title, created_at, updated_at FROM chats WHERE chat_id = $1",
+        chat_id,
+    )
+    if row is None or row["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="chat not found")
+
+    messages = await pool.fetch(
+        """
+        SELECT role, content, created_at
+        FROM messages
+        WHERE chat_id = $1
+        ORDER BY created_at ASC
+        """,
+        chat_id,
+    )
+    message_responses = [
+        ChatMessageResponse(
+            role=m["role"],
+            content=m["content"],
+            createdAt=m["created_at"],
+        )
+        for m in messages
+    ]
+    return ChatDetailResponse(
+        chatId=row["chat_id"],
+        title=row["title"],
+        createdAt=row["created_at"],
+        updatedAt=row["updated_at"],
+        messages=message_responses,
+    )
+
+@app.patch("/chats/{chat_id}")
+async def rename_chat(
+    chat_id: str,
+    req: RenameChatRequest,
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> RenameChatResponse:
+    if not req.title or len(req.title) > 100:
+        raise HTTPException(status_code=400, detail="title must be non-empty and at most 100 characters")
+
+    # Verify ownership
+    chat_account_id = await pool.fetchval(
+        "SELECT account_id FROM chats WHERE chat_id = $1",
+        chat_id,
+    )
+    if chat_account_id is None or chat_account_id != account_id:
+        raise HTTPException(status_code=404, detail="chat not found")
+
+    updated_at = now_ms()
+    await pool.execute(
+        "UPDATE chats SET title = $1, updated_at = $2 WHERE chat_id = $3",
+        req.title,
+        updated_at,
+        chat_id,
+    )
+    return RenameChatResponse(
+        chatId=chat_id,
+        title=req.title,
+        updatedAt=updated_at,
+    )
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(
+    chat_id: str,
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> DeleteChatResponse:
+    # Verify ownership
+    chat_account_id = await pool.fetchval(
+        "SELECT account_id FROM chats WHERE chat_id = $1",
+        chat_id,
+    )
+    if chat_account_id is None or chat_account_id != account_id:
+        raise HTTPException(status_code=404, detail="chat not found")
+
+    await pool.execute("DELETE FROM chats WHERE chat_id = $1", chat_id)
+    return DeleteChatResponse(ok=True)
+
+# ----------------------------------------------------------------------------
 # Routes — chat
 # ----------------------------------------------------------------------------
+
+async def generate_title(user_text: str, assistant_text: str) -> str:
+    """Generate a chat title using the text-tiny model."""
+    title_model = "llama-3.1-8b-instant"
+    title_prompt = [
+        {"role": "system", "content": "Generate a 3 to 6 word title for this conversation. Reply with the title only. No quotes. No punctuation at the end."},
+        {"role": "user", "content": f"User: {user_text}\n\nAssistant: {assistant_text}"},
+    ]
+
+    try:
+        payload = {
+            "model": title_model,
+            "messages": title_prompt,
+            "stream": False,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                GROQ_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            title = message.get("content") or ""
+            # Clean up: strip quotes and trim
+            title = title.strip().strip('"').strip("'")
+            # Trim to 100 characters
+            title = title[:100]
+            if title:
+                return title
+    except Exception:
+        pass
+
+    # Fallback: first 40 characters of user message
+    return user_text[:40].strip()
+
+def make_message_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:16]}"
+
+async def store_user_message(pool: asyncpg.Pool, chat_id: str, content: str) -> str:
+    """Store a user message and return the message_id."""
+    message_id = make_message_id()
+    await pool.execute(
+        """
+        INSERT INTO messages (message_id, chat_id, role, content, created_at)
+        VALUES ($1, $2, 'user', $3, $4)
+        """,
+        message_id,
+        chat_id,
+        content,
+        now_ms(),
+    )
+    return message_id
+
+async def store_assistant_message(
+    pool: asyncpg.Pool,
+    chat_id: str,
+    content: str | None = None,
+    tool_calls: list[dict] | None = None,
+) -> str:
+    """Store an assistant message and return the message_id."""
+    message_id = make_message_id()
+    await pool.execute(
+        """
+        INSERT INTO messages (message_id, chat_id, role, content, tool_calls, created_at)
+        VALUES ($1, $2, 'assistant', $3, $4, $5)
+        """,
+        message_id,
+        chat_id,
+        content,
+        tool_calls,
+        now_ms(),
+    )
+    return message_id
+
+async def store_tool_message(
+    pool: asyncpg.Pool,
+    chat_id: str,
+    content: str | None = None,
+    tool_call_id: str | None = None,
+) -> str:
+    """Store a tool message and return the message_id."""
+    message_id = make_message_id()
+    await pool.execute(
+        """
+        INSERT INTO messages (message_id, chat_id, role, content, tool_call_id, created_at)
+        VALUES ($1, $2, 'tool', $3, $4, $5)
+        """,
+        message_id,
+        chat_id,
+        content,
+        tool_call_id,
+        now_ms(),
+    )
+    return message_id
+
+async def verify_chat_ownership(pool: asyncpg.Pool, chat_id: str, account_id: str) -> bool:
+    """Verify that a chat exists and belongs to the account."""
+    chat_account_id = await pool.fetchval(
+        "SELECT account_id FROM chats WHERE chat_id = $1",
+        chat_id,
+    )
+    return chat_account_id is not None and chat_account_id == account_id
+
+async def update_chat_updated_at(pool: asyncpg.Pool, chat_id: str) -> None:
+    """Update the chat updated_at timestamp."""
+    await pool.execute(
+        "UPDATE chats SET updated_at = $1 WHERE chat_id = $2",
+        now_ms(),
+        chat_id,
+    )
 
 async def stream_groq(groq_messages, model, tools):
     payload = {
@@ -708,8 +1039,127 @@ async def stream_groq(groq_messages, model, tools):
         yield f'data: {{\"error\":\"stream error: {error_msg}\"}}\n\n'
         yield "data: [DONE]\n\n"
 
+async def stream_groq_with_storage(groq_messages, model, tools, chat_id, account_id, pool):
+    """Stream Groq response and store the full text at the end."""
+    import re
+
+    payload = {
+        "model": model,
+        "messages": groq_messages,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    buffer = []
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                GROQ_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    error_msg = body[:200].decode("utf-8", "ignore") if body else "Unknown error"
+                    yield f"data: {{\"error\":\"provider error {response.status_code}: {error_msg}\"}}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        # Parse and extract content for buffering
+                        try:
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                yield f"{line}\n\n"
+                                continue
+                            data_json = json.loads(data_str)
+                            if "choices" in data_json:
+                                for choice in data_json["choices"]:
+                                    if "delta" in choice:
+                                        delta = choice["delta"]
+                                        if "content" in delta:
+                                            buffer.append(delta["content"])
+                                        elif "tool_calls" in delta:
+                                            # For tool calls, we store the full tool_calls
+                                            pass
+                        except Exception:
+                            pass
+                        yield f"{line}\n\n"
+    except httpx.TimeoutException:
+        yield 'data: {"error":"upstream timeout"}\n\n'
+        yield "data: [DONE]\n\n"
+    except httpx.HTTPError as e:
+        yield f'data: {{\"error\":\"upstream error: {type(e).__name__}\"}}\n\n'
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        error_msg = str(e)[:200]
+        yield f'data: {{\"error\":\"stream error: {error_msg}\"}}\n\n'
+        yield "data: [DONE]\n\n"
+    else:
+        # Stream completed successfully, store the accumulated text
+        try:
+            full_text = "".join(buffer)
+            if full_text:
+                await store_assistant_message(
+                    pool, chat_id, full_text, None
+                )
+
+            # Store tool messages from the request
+            for m in groq_messages:
+                if m.get("role") == "tool":
+                    await store_tool_message(
+                        pool, chat_id, m.get("content"), m.get("tool_call_id")
+                    )
+
+            # Generate title if needed
+            # Get the user content from the request messages
+            user_content = None
+            for m in groq_messages:
+                if m.get("role") == "user" and m.get("content"):
+                    user_content = m["content"]
+                    break
+
+            if user_content and full_text:
+                chat_title = await pool.fetchval(
+                    "SELECT title FROM chats WHERE chat_id = $1",
+                    chat_id,
+                )
+                if chat_title is None:
+                    msg_count = await pool.fetchval(
+                        "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND role = 'assistant'",
+                        chat_id,
+                    )
+                    if msg_count is not None and msg_count == 1:
+                        title = await generate_title(user_content, full_text)
+                        await pool.execute(
+                            "UPDATE chats SET title = $1, updated_at = $2 WHERE chat_id = $3",
+                            title,
+                            now_ms(),
+                            chat_id,
+                        )
+
+            # Update chat updated_at
+            await update_chat_updated_at(pool, chat_id)
+        except Exception:
+            pass
+
+        return
+
 @app.post("/chat")
-async def chat(req: ChatRequest, account_id: str = Depends(get_current_account)):
+async def chat(
+    req: ChatRequest,
+    account_id: str = Depends(get_current_account),
+    pool: asyncpg.Pool = Depends(get_pool),
+):
     if req.task in ("tts", "tts-arabic", "stt", "stt-fast"):
         if not TTS_STT_ENABLED:
             raise HTTPException(
@@ -750,6 +1200,13 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
         if m.role not in ("tool",) and m.content is None and m.tool_calls is None:
             raise HTTPException(status_code=400, detail="message content must not be null")
 
+    # Handle chat_id if present
+    chat_id = req.chat_id
+    if chat_id:
+        # Verify chat exists and belongs to account
+        if not await verify_chat_ownership(pool, chat_id, account_id):
+            raise HTTPException(status_code=404, detail="chat not found")
+
     # Build messages for Groq, preserving all fields
     groq_messages = []
     for m in req.messages:
@@ -763,14 +1220,42 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
         groq_messages.append(msg)
 
     if req.stream:
-        return StreamingResponse(
-            stream_groq(groq_messages, model, req.tools),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        if chat_id:
+            # Store user message before streaming
+            user_content = None
+            for m in req.messages:
+                if m.role == "user" and m.content is not None:
+                    user_content = m.content
+                    break
+            if user_content:
+                await store_user_message(pool, chat_id, user_content)
+
+            # Store tool messages if present
+            for m in req.messages:
+                if m.role == "tool":
+                    await store_tool_message(
+                        pool, chat_id, m.content, m.tool_call_id
+                    )
+
+            return StreamingResponse(
+                stream_groq_with_storage(
+                    groq_messages, model, req.tools, chat_id, account_id, pool
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            return StreamingResponse(
+                stream_groq(groq_messages, model, req.tools),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
     payload = {
         "model": model,
@@ -847,6 +1332,55 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
     if message.get("tool_calls"):
         response_message["tool_calls"] = message["tool_calls"]
 
+    # Store messages if chat_id is present
+    if chat_id:
+        # Store user message
+        user_content = None
+        for m in req.messages:
+            if m.role == "user" and m.content is not None:
+                user_content = m.content
+                break
+        if user_content:
+            await store_user_message(pool, chat_id, user_content)
+
+        # Store tool messages if present
+        for m in req.messages:
+            if m.role == "tool":
+                await store_tool_message(
+                    pool, chat_id, m.content, m.tool_call_id
+                )
+
+        # Store assistant response
+        assistant_content = message.get("content")
+        assistant_tool_calls = message.get("tool_calls")
+        await store_assistant_message(
+            pool, chat_id, assistant_content, assistant_tool_calls
+        )
+
+        # Generate title if needed (first assistant response and title is NULL)
+        if user_content and assistant_content:
+            chat_title = await pool.fetchval(
+                "SELECT title FROM chats WHERE chat_id = $1",
+                chat_id,
+            )
+            if chat_title is None:
+                # Check if this is the first assistant message
+                msg_count = await pool.fetchval(
+                    "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND role = 'assistant'",
+                    chat_id,
+                )
+                if msg_count is not None and msg_count == 1:
+                    title = await generate_title(user_content, assistant_content)
+                    await pool.execute(
+                        "UPDATE chats SET title = $1, updated_at = $2 WHERE chat_id = $3",
+                        title,
+                        now_ms(),
+                        chat_id,
+                    )
+
+        # Update chat updated_at
+        await update_chat_updated_at(pool, chat_id)
+
     usage = data.get("usage") or {}
     return {
         "message": response_message,
@@ -869,3 +1403,4 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     else:
         body = {"detail": detail}
     return JSONResponse(status_code=exc.status_code, content=body)
+ 
