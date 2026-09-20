@@ -19,6 +19,8 @@ GROQ_SPEECH_URL = f"{GROQ_BASE}/audio/speech"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAX_TTS_CHARS = 2500
 TTS_CACHE_TTL_SECONDS = 3600
+TTS_DEFAULT_VOICE = "austin"
+TTS_RESPONSE_FORMAT = "wav"
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +66,11 @@ async def transcribe(
         raise HTTPException(status_code=500, detail=f"transcription provider error: {type(e).__name__}")
 
     if resp.status_code != 200:
+        # Include the provider's own message when available.
+        detail = _extract_provider_error(resp)
         raise HTTPException(
             status_code=500,
-            detail=f"transcription provider rejected request: {resp.status_code}",
+            detail=f"transcription provider rejected request: {resp.status_code} {detail}".strip(),
         )
 
     payload = resp.json()
@@ -98,16 +102,16 @@ async def speak(
     if not model:
         raise HTTPException(status_code=500, detail="tts model is not configured")
 
-    # Cache key: sha256 over "model\ntext". Same text -> same audio.
-    key_input = f"{model}\n{text}".encode("utf-8")
+    # Cache key: sha256 over model + voice + format + text.
+    # Any change to the voice or format invalidates the cache for that text.
+    key_input = f"{model}\n{TTS_DEFAULT_VOICE}\n{TTS_RESPONSE_FORMAT}\n{text}".encode("utf-8")
     cache_key = "tts:" + hashlib.sha256(key_input).hexdigest()
 
-    # Try cache first.
     cached = await cache.get(cache_key)
     if cached:
         try:
             payload = json.loads(cached)
-            content_type = payload.get("content_type") or "audio/mpeg"
+            content_type = payload.get("content_type") or "audio/wav"
             audio_b64 = payload.get("audio_b64") or ""
             audio_bytes = base64.b64decode(audio_b64)
             return Response(
@@ -116,13 +120,14 @@ async def speak(
                 headers={"X-Cache": "HIT"},
             )
         except Exception:
-            # Corrupt or unexpected cache entry. Fall through to regeneration.
+            # Corrupt or unexpected entry. Fall through and regenerate.
             pass
 
     request_body = {
         "model": model,
+        "voice": TTS_DEFAULT_VOICE,
+        "response_format": TTS_RESPONSE_FORMAT,
         "input": text,
-        "response_format": "mp3",
     }
 
     try:
@@ -141,15 +146,15 @@ async def speak(
         raise HTTPException(status_code=500, detail=f"speech provider error: {type(e).__name__}")
 
     if resp.status_code != 200:
+        detail = _extract_provider_error(resp)
         raise HTTPException(
             status_code=500,
-            detail=f"speech provider rejected request: {resp.status_code}",
+            detail=f"speech provider rejected request: {resp.status_code} {detail}".strip(),
         )
 
     audio_bytes = resp.content
-    content_type = resp.headers.get("content-type") or "audio/mpeg"
+    content_type = resp.headers.get("content-type") or "audio/wav"
 
-    # Best-effort cache write. Failure is not fatal.
     try:
         cache_payload = json.dumps({
             "content_type": content_type,
@@ -164,3 +169,39 @@ async def speak(
         media_type=content_type,
         headers={"X-Cache": "MISS"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_provider_error(resp: httpx.Response) -> str:
+    """
+    Pull a short, human-readable error out of the provider's response body.
+    Falls back to an empty string if the body cannot be parsed.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        try:
+            text = resp.text or ""
+            return text[:300]
+        except Exception:
+            return ""
+
+    if not isinstance(body, dict):
+        return ""
+
+    err = body.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg:
+            return msg[:300]
+    if isinstance(err, str) and err:
+        return err[:300]
+
+    detail = body.get("detail")
+    if isinstance(detail, str) and detail:
+        return detail[:300]
+
+    return ""
