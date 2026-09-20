@@ -10,8 +10,6 @@ Endpoints:
     POST /chat
     GET  /capabilities
     GET  /models
-    POST /web/search
-    POST /web/fetch
 
 Storage: Postgres. Accounts and sessions persist across redeploys.
 
@@ -28,6 +26,7 @@ import asyncpg
 import bcrypt
 import httpx
 import jwt
+import redis.asyncio as redis_async
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -45,6 +44,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+VALKEY_URL = os.getenv("VALKEY_URL", "")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
@@ -54,10 +54,10 @@ GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 BCRYPT_ROUNDS = 12
 
 MODEL_BY_TASK = {
-    "text":           "qwen/qwen3.8-27b",
+    "text":           "openai/gpt-oss-120b",
     "text-fast":      "openai/gpt-oss-20b",
     "text-tiny":      "llama-3.1-8b-instant",
-    "reasoning":      "qwen/qwen3.8-27b",
+    "reasoning":      "openai/gpt-oss-120b",
     "reasoning-deep": "openai/gpt-oss-120b",
     "vision":         "qwen/qwen3.8-27b",
     "moderation":     "openai/gpt-oss-safeguard-20b",
@@ -70,6 +70,62 @@ MODEL_BY_TASK = {
 TTS_STT_ENABLED = False
 
 app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
+
+# ----------------------------------------------------------------------------
+# Valkey Cache
+# ----------------------------------------------------------------------------
+
+class Cache:
+    def __init__(self, url: str):
+        self._url = url
+        self._client: Optional[redis_async.Redis] = None
+        self._enabled = bool(url)
+
+    async def _get_client(self) -> Optional[redis_async.Redis]:
+        if not self._enabled:
+            return None
+        if self._client is None:
+            try:
+                self._client = redis_async.from_url(
+                    self._url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    socket_timeout=1.0,
+                    socket_connect_timeout=1.0,
+                )
+            except Exception:
+                self._enabled = False
+                return None
+        return self._client
+
+    async def get(self, key: str) -> Optional[str]:
+        client = await self._get_client()
+        if client is None:
+            return None
+        try:
+            return await client.get(key)
+        except Exception:
+            return None
+
+    async def setex(self, key: str, ttl_seconds: int, value: str) -> None:
+        client = await self._get_client()
+        if client is None:
+            return
+        try:
+            await client.setex(key, ttl_seconds, value)
+        except Exception:
+            pass
+
+    async def delete(self, key: str) -> None:
+        client = await self._get_client()
+        if client is None:
+            return
+        try:
+            await client.delete(key)
+        except Exception:
+            pass
+
+cache = Cache(VALKEY_URL)
 
 # ----------------------------------------------------------------------------
 # Database
@@ -127,6 +183,12 @@ async def on_startup():
             await conn.execute(MIGRATION_SQL)
         except Exception:
             pass
+
+    # Warm up Valkey cache connection
+    try:
+        await cache.get("__probe__")
+    except Exception:
+        pass
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -218,6 +280,20 @@ async def get_current_account(
     if not token:
         raise HTTPException(status_code=401, detail="missing session token")
 
+    # Try Valkey cache first
+    cache_key = f"session:{token}"
+    cached = await cache.get(cache_key)
+    if cached:
+        try:
+            data = json.loads(cached)
+            account_id = data.get("account_id")
+            expires_at = data.get("expires_at")
+            if account_id and expires_at and expires_at > now_ms():
+                return account_id
+        except Exception:
+            pass
+
+    # Fall back to Postgres
     row = await pool.fetchrow(
         "SELECT account_id, expires_at FROM sessions WHERE token = $1",
         token,
@@ -226,9 +302,20 @@ async def get_current_account(
         raise HTTPException(status_code=401, detail="invalid session")
     if row["expires_at"] < now_ms():
         await pool.execute("DELETE FROM sessions WHERE token = $1", token)
+        await cache.delete(cache_key)
         raise HTTPException(status_code=401, detail="session expired")
 
     decode_token(token)
+
+    # Populate cache with 5-minute TTL
+    await cache.setex(
+        cache_key,
+        300,
+        json.dumps({
+            "account_id": row["account_id"],
+            "expires_at": row["expires_at"],
+        }),
+    )
     return row["account_id"]
 
 # ----------------------------------------------------------------------------
@@ -412,6 +499,7 @@ async def logout(
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
         await pool.execute("DELETE FROM sessions WHERE token = $1", token)
+        await cache.delete(f"session:{token}")
     return {"ok": True}
 
 @app.get("/auth/session")
@@ -439,13 +527,22 @@ async def session_check(
 
 @app.get("/capabilities")
 async def capabilities(account_id: str = Depends(get_current_account)) -> dict[str, bool]:
-    return {
+    cached = await cache.get("capabilities:v1")
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    payload = {
         "text": True,
         "vision": True,
         "reasoning": True,
         "tts": TTS_STT_ENABLED,
         "stt": TTS_STT_ENABLED,
     }
+    await cache.setex("capabilities:v1", 3600, json.dumps(payload))
+    return payload
 
 # ----------------------------------------------------------------------------
 # Routes — models
@@ -453,7 +550,16 @@ async def capabilities(account_id: str = Depends(get_current_account)) -> dict[s
 
 @app.get("/models")
 async def models() -> dict[str, str]:
-    return dict(MODEL_BY_TASK)
+    cached = await cache.get("models:v1")
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    payload = dict(MODEL_BY_TASK)
+    await cache.setex("models:v1", 3600, json.dumps(payload))
+    return payload
 
 # ----------------------------------------------------------------------------
 # Routes — web (Tavily proxy)
@@ -688,7 +794,7 @@ async def chat(req: ChatRequest, account_id: str = Depends(get_current_account))
             )
     except httpx.TimeoutException:
         raise HTTPException(status_code=500, detail="upstream timeout from provider")
-    except httpx.HTTPError as e:
+    except httpx.HTTPException as e:
         raise HTTPException(status_code=500, detail=f"upstream error: {type(e).__name__}")
 
     if resp.status_code == 429:
