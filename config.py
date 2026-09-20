@@ -26,7 +26,7 @@ TTS_STT_ENABLED = False
 
 # Model mapping by task
 MODEL_BY_TASK = {
-    "text": "openai/gpt-oss-120b",
+    "text": "qwen/qwen3.8-27b",
     "text-fast": "openai/gpt-oss-20b",
     "text-tiny": "llama-3.1-8b-instant",
     "reasoning": "openai/gpt-oss-120b",
