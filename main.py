@@ -18,6 +18,7 @@ Endpoints:
     GET  /models
     POST /web/search
     POST /web/fetch
+    POST /audio/transcribe
 
 Storage: Postgres. Accounts and sessions persist across redeploys.
 
@@ -34,6 +35,7 @@ from routers import chat as chat_router
 from routers import chats as chats_router
 from routers import web as web_router
 from routers import misc as misc_router
+from routers import audio as audio_router
 
 app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
 
@@ -43,6 +45,7 @@ app.include_router(chat_router.router)
 app.include_router(chats_router.router)
 app.include_router(web_router.router)
 app.include_router(misc_router.router)
+app.include_router(audio_router.router)
 
 # Startup and shutdown events
 @app.on_event("startup")
