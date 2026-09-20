@@ -21,12 +21,15 @@ BCRYPT_ROUNDS = 12
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 
+# STT model
+STT_MODEL = "whisper-large-v3-turbo"
+
 # Feature flags
 TTS_STT_ENABLED = False
 
 # Model mapping by task
 MODEL_BY_TASK = {
-    "text": "qwen/qwen3.8-27b",
+    "text": "openai/gpt-oss-120b",
     "text-fast": "openai/gpt-oss-20b",
     "text-tiny": "llama-3.1-8b-instant",
     "reasoning": "openai/gpt-oss-120b",
