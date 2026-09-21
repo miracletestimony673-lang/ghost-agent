@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 
 from db import init_db, close_db
 from cache import cache, init_cache
-from config import REDIS_URL
+from config import VALKEY_URL
 from routers import auth as auth_router
 from routers import chat as chat_router
 from routers import chats as chats_router
