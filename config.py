@@ -8,7 +8,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-VALKEY_URL = os.getenv("VALKEY_URL", "")
+VALKEY_URL = os.getenv("REDIS_URL", "")
 
 # JWT constants
 JWT_ALGORITHM = "HS256"
