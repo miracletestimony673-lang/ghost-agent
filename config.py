@@ -25,11 +25,11 @@ GROQ_CHAT_URL = f"{GROQ_BASE}/chat/completions"
 STT_MODEL = "whisper-large-v3-turbo"
 
 # Feature flags
-TTS_STT_ENABLED = False
+TTS_STT_ENABLED = True
 
 # Model mapping by task
 MODEL_BY_TASK = {
-    "text": "openai/gpt-oss-120b",
+    "text": "qwen/qwen3.8-27b",
     "text-fast": "openai/gpt-oss-20b",
     "reasoning": "openai/gpt-oss-120b",
     "reasoning-deep": "openai/gpt-oss-120b",
