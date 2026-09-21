@@ -57,7 +57,7 @@ async def on_startup():
     # Point the cache singleton at the real Valkey URL, then warm it up.
     init_cache(VALKEY_URL)
     try:
-        await cache.get("__probe__")
+        await cache.ping()
     except Exception:
         pass
 
