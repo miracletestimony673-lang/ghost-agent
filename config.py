@@ -31,7 +31,6 @@ TTS_STT_ENABLED = False
 MODEL_BY_TASK = {
     "text": "openai/gpt-oss-120b",
     "text-fast": "openai/gpt-oss-20b",
-    "text-tiny": "llama-3.1-8b-instant",
     "reasoning": "openai/gpt-oss-120b",
     "reasoning-deep": "openai/gpt-oss-120b",
     "vision": "qwen/qwen3.8-27b",

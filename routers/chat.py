@@ -94,8 +94,8 @@ async def update_chat_updated_at(pool: asyncpg.Pool, chat_id: str) -> None:
     )
 
 async def generate_title(user_text: str, assistant_text: str) -> str:
-    """Generate a chat title using the text-tiny model."""
-    title_model = "llama-3.1-8b-instant"
+    """Generate a chat title using the fast text model."""
+    title_model = MODEL_BY_TASK.get("text-fast", "openai/gpt-oss-20b")
     title_prompt = [
         {"role": "system", "content": "Generate a 3 to 6 word title for this conversation. Reply with the title only. No quotes. No punctuation at the end."},
         {"role": "user", "content": f"User: {user_text}\n\nAssistant: {assistant_text}"},

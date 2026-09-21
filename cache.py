@@ -10,8 +10,11 @@ import logging
 from typing import Optional
 
 import redis.asyncio as redis_async
+import redis.exceptions as redis_exc
 
 logger = logging.getLogger("ghost.cache")
+
+MAX_VALUE_BYTES = 32 * 1024  # 32 KB hard cap
 
 
 class Cache:
@@ -45,6 +48,19 @@ class Cache:
                 return None
         return self._client
 
+    def _is_conn_error(self, e: Exception) -> bool:
+        return isinstance(
+            e, (redis_exc.ConnectionError, redis_exc.TimeoutError, TimeoutError, ConnectionError)
+        )
+
+    async def _reset_on_conn_error(self, e: Exception) -> None:
+        if self._is_conn_error(e) and self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+
     async def get(self, key: str) -> Optional[str]:
         client = await self._get_client()
         if client is None:
@@ -52,17 +68,37 @@ class Cache:
         try:
             return await client.get(key)
         except Exception as e:
-            logger.warning("Cache get failed for key %s: %s", key, e)
+            is_conn = self._is_conn_error(e)
+            if is_conn:
+                logger.error("Cache get failed for key %s: %s", key, e)
+            else:
+                logger.warning("Cache get failed for key %s: %s", key, e)
+            await self._reset_on_conn_error(e)
             return None
 
     async def setex(self, key: str, ttl_seconds: int, value: str) -> None:
         client = await self._get_client()
         if client is None:
             return
+        if isinstance(value, str):
+            size = len(value.encode("utf-8"))
+        else:
+            size = len(value)
+        if size > MAX_VALUE_BYTES:
+            logger.warning(
+                "Cache setex skipped for key %s: value size %d exceeds cap %d",
+                key, size, MAX_VALUE_BYTES,
+            )
+            return
         try:
             await client.setex(key, ttl_seconds, value)
         except Exception as e:
-            logger.warning("Cache setex failed for key %s: %s", key, e)
+            is_conn = self._is_conn_error(e)
+            if is_conn:
+                logger.error("Cache setex failed for key %s: %s", key, e)
+            else:
+                logger.warning("Cache setex failed for key %s: %s", key, e)
+            await self._reset_on_conn_error(e)
 
     async def delete(self, key: str) -> None:
         client = await self._get_client()
@@ -71,7 +107,12 @@ class Cache:
         try:
             await client.delete(key)
         except Exception as e:
-            logger.warning("Cache delete failed for key %s: %s", key, e)
+            is_conn = self._is_conn_error(e)
+            if is_conn:
+                logger.error("Cache delete failed for key %s: %s", key, e)
+            else:
+                logger.warning("Cache delete failed for key %s: %s", key, e)
+            await self._reset_on_conn_error(e)
 
     async def ping(self) -> bool:
         """
@@ -137,5 +178,21 @@ class Cache:
         return report
 
 
-# The singleton. Instantiated in main.py from config.VALKEY_URL.
+# The singleton. Instantiated empty; init_cache() below wires it to
+# config.VALKEY_URL from main.py's startup handler.
 cache: Cache = Cache("")
+
+
+def init_cache(url: str) -> None:
+    """
+    Re-point the module-level `cache` singleton at a real Valkey URL.
+
+    Safe to call once at startup. Does not change the Cache class's
+    public interface — it just flips the existing instance's config
+    so get/setex/delete/ping/probe start using a real connection.
+    """
+    cache._url = url
+    cache._enabled = bool(url)
+    cache._client = None
+    cache._reported_disabled = False
+    cache._reported_connect_error = False

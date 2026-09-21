@@ -17,7 +17,7 @@ router = APIRouter(tags=["audio"])
 GROQ_TRANSCRIBE_URL = f"{GROQ_BASE}/audio/transcriptions"
 GROQ_SPEECH_URL = f"{GROQ_BASE}/audio/speech"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
-MAX_TTS_CHARS = 2500
+MAX_TTS_CHARS = 2000
 TTS_CACHE_TTL_SECONDS = 3600
 TTS_DEFAULT_VOICE = "austin"
 TTS_RESPONSE_FORMAT = "wav"

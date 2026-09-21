@@ -29,13 +29,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from db import init_db, close_db
-from cache import cache
+from cache import cache, init_cache
+from config import VALKEY_URL
 from routers import auth as auth_router
 from routers import chat as chat_router
 from routers import chats as chats_router
 from routers import web as web_router
 from routers import misc as misc_router
 from routers import audio as audio_router
+from routers import debug as debug_router
 
 app = FastAPI(title="Ghost Agent Backend", version="phase4-pg")
 
@@ -46,12 +48,14 @@ app.include_router(chats_router.router)
 app.include_router(web_router.router)
 app.include_router(misc_router.router)
 app.include_router(audio_router.router)
+app.include_router(debug_router.router)
 
 # Startup and shutdown events
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    # Warm up Valkey cache connection
+    # Point the cache singleton at the real Valkey URL, then warm it up.
+    init_cache(VALKEY_URL)
     try:
         await cache.get("__probe__")
     except Exception:
