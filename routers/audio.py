@@ -1,14 +1,9 @@
 """Audio router: /audio/* endpoints for speech-to-text and text-to-speech."""
 
-import base64
-import hashlib
-import json
-
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
 
-from cache import cache
 from config import GROQ_API_KEY, GROQ_BASE, MODEL_BY_TASK, STT_MODEL
 from helpers import get_current_account
 
@@ -18,7 +13,6 @@ GROQ_TRANSCRIBE_URL = f"{GROQ_BASE}/audio/transcriptions"
 GROQ_SPEECH_URL = f"{GROQ_BASE}/audio/speech"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAX_TTS_CHARS = 2000
-TTS_CACHE_TTL_SECONDS = 3600
 TTS_DEFAULT_VOICE = "austin"
 TTS_RESPONSE_FORMAT = "wav"
 
@@ -102,27 +96,6 @@ async def speak(
     if not model:
         raise HTTPException(status_code=500, detail="tts model is not configured")
 
-    # Cache key: sha256 over model + voice + format + text.
-    # Any change to the voice or format invalidates the cache for that text.
-    key_input = f"{model}\n{TTS_DEFAULT_VOICE}\n{TTS_RESPONSE_FORMAT}\n{text}".encode("utf-8")
-    cache_key = "tts:" + hashlib.sha256(key_input).hexdigest()
-
-    cached = await cache.get(cache_key)
-    if cached:
-        try:
-            payload = json.loads(cached)
-            content_type = payload.get("content_type") or "audio/wav"
-            audio_b64 = payload.get("audio_b64") or ""
-            audio_bytes = base64.b64decode(audio_b64)
-            return Response(
-                content=audio_bytes,
-                media_type=content_type,
-                headers={"X-Cache": "HIT"},
-            )
-        except Exception:
-            # Corrupt or unexpected entry. Fall through and regenerate.
-            pass
-
     request_body = {
         "model": model,
         "voice": TTS_DEFAULT_VOICE,
@@ -155,19 +128,9 @@ async def speak(
     audio_bytes = resp.content
     content_type = resp.headers.get("content-type") or "audio/wav"
 
-    try:
-        cache_payload = json.dumps({
-            "content_type": content_type,
-            "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
-        })
-        await cache.setex(cache_key, TTS_CACHE_TTL_SECONDS, cache_payload)
-    except Exception:
-        pass
-
     return Response(
         content=audio_bytes,
         media_type=content_type,
-        headers={"X-Cache": "MISS"},
     )
 
 
